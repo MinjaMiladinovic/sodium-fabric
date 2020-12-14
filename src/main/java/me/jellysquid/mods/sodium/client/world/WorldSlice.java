@@ -1,438 +1,393 @@
-package me.jellysquid.mods.sodium.client.world;
+package me.jellysquid.mods.sodium.client.render.chunk.compile;
 
-import it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap;
-import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuilder;
-import me.jellysquid.mods.sodium.client.world.biome.BiomeCache;
+import me.jellysquid.mods.sodium.client.gl.attribute.GlVertexFormat;
+import me.jellysquid.mods.sodium.client.render.chunk.ChunkGraphicsState;
+import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderBackend;
+import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderContainer;
+import me.jellysquid.mods.sodium.client.render.chunk.tasks.ChunkRenderBuildTask;
+import me.jellysquid.mods.sodium.client.render.chunk.tasks.ChunkRenderEmptyBuildTask;
+import me.jellysquid.mods.sodium.client.render.chunk.tasks.ChunkRenderRebuildTask;
+import me.jellysquid.mods.sodium.client.render.pipeline.context.ChunkRenderContext;
+import me.jellysquid.mods.sodium.client.util.task.CancellationSource;
+import me.jellysquid.mods.sodium.client.world.ClientWorldExtended;
+import me.jellysquid.mods.sodium.client.world.WorldSlice;
 import me.jellysquid.mods.sodium.client.world.biome.BiomeCacheManager;
-import me.jellysquid.mods.sodium.client.world.biome.BiomeColorCache;
-import me.jellysquid.mods.sodium.common.util.pool.ReusableObject;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.entity.BlockEntity;
-import net.minecraft.fluid.FluidState;
-import net.minecraft.util.math.BlockPos;
+import me.jellysquid.mods.sodium.common.util.collections.DequeDrain;
+import me.jellysquid.mods.sodium.common.util.pool.ObjectPool;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.util.math.Vector3d;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.ChunkSectionPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.world.BlockRenderView;
-import net.minecraft.world.LightType;
 import net.minecraft.world.World;
-import net.minecraft.world.biome.Biome;
-import net.minecraft.world.biome.source.BiomeAccess;
-import net.minecraft.world.biome.source.BiomeArray;
-import net.minecraft.world.chunk.ChunkNibbleArray;
-import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.chunk.WorldChunk;
-import net.minecraft.world.chunk.light.ChunkLightingView;
-import net.minecraft.world.chunk.light.LightingProvider;
-import net.minecraft.world.level.ColorResolver;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
-import java.util.Arrays;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Takes a slice of world state (block states, biome and light data arrays) and copies the data for use in off-thread
- * operations. This allows chunk build tasks to see a consistent snapshot of chunk data at the exact moment the task was
- * created.
- *
- * World slices are not safe to use from multiple threads at once, but the data they contain is safe from modification
- * by the main client thread.
- *
- * You should use object pooling with this type to avoid huge allocations as instances of this class contain many large
- * arrays.
- */
-public class WorldSlice extends ReusableObject implements BlockRenderView, BiomeAccess.Storage {
-    // The number of outward blocks from the origin chunk to slice
-    public static final int NEIGHBOR_BLOCK_RADIUS = 1;
+public class ChunkBuilder<T extends ChunkGraphicsState> {
+    /**
+     * The maximum number of jobs that can be queued for a given worker thread.
+     */
+    private static final int TASK_QUEUE_LIMIT_PER_WORKER = 2;
 
-    // The number of outward chunks from the origin chunk to slice
-    public static final int NEIGHBOR_CHUNK_RADIUS = MathHelper.roundUpToMultiple(NEIGHBOR_BLOCK_RADIUS, 16) >> 4;
+    private static final Logger LOGGER = LogManager.getLogger("ChunkBuilder");
 
-    // The length of the chunk section array on each axis
-    public static final int SECTION_LENGTH = 1 + (NEIGHBOR_CHUNK_RADIUS * 2);
+    private final Deque<WrappedTask<T>> buildQueue = new ConcurrentLinkedDeque<>();
+    private final Deque<ChunkBuildResult<T>> uploadQueue = new ConcurrentLinkedDeque<>();
 
-    // The number of blocks
-    public static final int BLOCK_LENGTH = 16 + (NEIGHBOR_BLOCK_RADIUS * 2);
+    private final Object jobNotifier = new Object();
 
-    // The number of blocks contained by a world slice
-    public static final int BLOCK_COUNT = BLOCK_LENGTH * BLOCK_LENGTH * BLOCK_LENGTH;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final List<Thread> threads = new ArrayList<>();
 
-    // The number of chunk sections contained by a world slice
-    public static final int SECTION_COUNT = SECTION_LENGTH * SECTION_LENGTH * SECTION_LENGTH;
+    private final ObjectPool<WorldSlice> pool;
 
-    // The number of chunks contained by a world slice
-    public static final int CHUNK_COUNT = SECTION_LENGTH * SECTION_LENGTH;
-
-    private static final ChunkSection EMPTY_SECTION = new ChunkSection(0);
-
-    // The data arrays for this slice
-    // These are allocated once and then re-used when the slice is released back to an object pool
-    private final BlockState[] blockStates;
-    private final ChunkNibbleArray[] blockLightArrays;
-    private final ChunkNibbleArray[] skyLightArrays;
-    private final BiomeCache[] biomeCaches;
-    private final BiomeArray[] biomeArrays;
-
-    // The biome blend caches for each color resolver type
-    // This map is always re-initialized, but the caches themselves are taken from an object pool
-    private final Map<ColorResolver, BiomeColorCache> colorResolvers = new Reference2ObjectOpenHashMap<>();
-
-    // The previously accessed and cached color resolver, used in conjunction with the cached color cache field
-    private ColorResolver prevColorResolver;
-
-    // The cached lookup result for the previously accessed color resolver to avoid excess hash table accesses
-    // for vertex color blending
-    private BiomeColorCache prevColorCache;
-
-    // The world this slice has copied data from, not thread-safe
     private World world;
-
-    // Pointers to the chunks this slice encompasses, not thread-safe
-    private WorldChunk[] chunks;
-
+    private Vector3d cameraPosition;
     private BiomeCacheManager biomeCacheManager;
 
-    // The starting point from which this slice captures chunks
-    private int chunkOffsetX, chunkOffsetY, chunkOffsetZ;
+    private final int limitThreads;
+    private final GlVertexFormat<?> format;
+    private final ChunkRenderBackend<T> backend;
 
-    // The starting point from which this slice captures blocks
-    private int blockOffsetX, blockOffsetY, blockOffsetZ;
+    public ChunkBuilder(GlVertexFormat<?> format, ChunkRenderBackend<T> backend) {
+        this.format = format;
+        this.backend = backend;
+        this.limitThreads = getOptimalThreadCount();
+        this.pool = new ObjectPool<>(this.getSchedulingBudget(), WorldSlice::new);
+    }
 
-    public static WorldChunk[] createChunkSlice(World world, ChunkSectionPos pos) {
-        WorldChunk chunk = world.getChunk(pos.getX(), pos.getZ());
-        ChunkSection section = chunk.getSectionArray()[pos.getY()];
+    /**
+     * Returns the remaining number of build tasks which should be scheduled this frame. If an attempt is made to
+     * spawn more tasks than the budget allows, it will block until resources become available.
+     */
+    public int getSchedulingBudget() {
+        return Math.max(0, (this.limitThreads * TASK_QUEUE_LIMIT_PER_WORKER) - this.buildQueue.size());
+    }
 
-        // If the chunk section is absent or empty, simply terminate now. There will never be anything in this chunk
-        // section to render, so we need to signal that a chunk render task shouldn't created. This saves a considerable
-        // amount of time in queueing instant build tasks and greatly accelerates how quickly the world can be loaded.
-        if (section == null || section.isEmpty()) {
-            return null;
+    /**
+     * Spawns a number of work-stealing threads to process results in the build queue. If the builder is already
+     * running, this method does nothing and exits.
+     */
+    public void startWorkers() {
+        if (this.running.getAndSet(true)) {
+            return;
         }
 
-        int minChunkX = pos.getX() - NEIGHBOR_CHUNK_RADIUS;
-        int minChunkZ = pos.getZ() - NEIGHBOR_CHUNK_RADIUS;
+        if (!this.threads.isEmpty()) {
+            throw new IllegalStateException("Threads are still alive while in the STOPPED state");
+        }
 
-        int maxChunkX = pos.getX() + NEIGHBOR_CHUNK_RADIUS;
-        int maxChunkZ = pos.getZ() + NEIGHBOR_CHUNK_RADIUS;
+        MinecraftClient client = MinecraftClient.getInstance();
 
-        WorldChunk[] chunks = new WorldChunk[SECTION_LENGTH * SECTION_LENGTH];
+        for (int i = 0; i < this.limitThreads; i++) {
+            ChunkBuildBuffers buffers = new ChunkBuildBuffers(this.format);
+            ChunkRenderContext pipeline = new ChunkRenderContext(client);
 
-        // Create an array of references to the world chunks in this slice
-        for (int x = minChunkX; x <= maxChunkX; x++) {
-            for (int z = minChunkZ; z <= maxChunkZ; z++) {
-                chunks[getLocalChunkIndex(x - minChunkX, z - minChunkZ)] = world.getChunk(x, z);
+            WorkerRunnable worker = new WorkerRunnable(buffers, pipeline);
+
+            Thread thread = new Thread(worker, "Chunk Render Task Executor #" + i);
+            thread.setPriority(Math.max(0, Thread.NORM_PRIORITY - 2));
+            thread.start();
+
+            this.threads.add(thread);
+        }
+
+        LOGGER.info("Started {} worker threads", this.threads.size());
+    }
+
+    /**
+     * Notifies all worker threads to stop and blocks until all workers terminate. After the workers have been shut
+     * down, all tasks are cancelled and the pending queues are cleared. If the builder is already stopped, this
+     * method does nothing and exits.
+     */
+    public void stopWorkers() {
+        if (!this.running.getAndSet(false)) {
+            return;
+        }
+
+        if (this.threads.isEmpty()) {
+            throw new IllegalStateException("No threads are alive but the executor is in the RUNNING state");
+        }
+
+        LOGGER.info("Stopping worker threads");
+
+        // Notify all worker threads to wake up, where they will then terminate
+        synchronized (this.jobNotifier) {
+            this.jobNotifier.notifyAll();
+        }
+
+        // Wait for every remaining thread to terminate
+        for (Thread thread : this.threads) {
+            try {
+                thread.join();
+            } catch (InterruptedException ignored) {
             }
         }
 
-        return chunks;
+        this.threads.clear();
+
+        // Drop any pending work queues and cancel futures
+        this.uploadQueue.clear();
+
+        for (WrappedTask<?> job : this.buildQueue) {
+            job.future.cancel(true);
+        }
+
+        this.buildQueue.clear();
+
+        this.world = null;
+        this.biomeCacheManager = null;
+        this.pool.reset();
     }
 
-    public WorldSlice() {
-        this.blockStates = new BlockState[BLOCK_COUNT];
-        this.blockLightArrays = new ChunkNibbleArray[SECTION_COUNT];
-        this.skyLightArrays = new ChunkNibbleArray[SECTION_COUNT];
-        this.biomeCaches = new BiomeCache[CHUNK_COUNT];
-        this.biomeArrays = new BiomeArray[CHUNK_COUNT];
+    /**
+     * Processes all pending build task uploads using the chunk render backend.
+     */
+    // TODO: Limit the amount of time this can take per frame
+    public boolean performPendingUploads() {
+        if (this.uploadQueue.isEmpty()) {
+            return false;
+        }
+
+        this.backend.uploadChunks(new DequeDrain<>(this.uploadQueue));
+
+        return true;
     }
 
-    public void init(ChunkBuilder<?> builder, World world, ChunkSectionPos chunkPos, WorldChunk[] chunks) {
-        final int minX = chunkPos.getMinX() - NEIGHBOR_BLOCK_RADIUS;
-        final int minY = chunkPos.getMinY() - NEIGHBOR_BLOCK_RADIUS;
-        final int minZ = chunkPos.getMinZ() - NEIGHBOR_BLOCK_RADIUS;
+    public CompletableFuture<ChunkBuildResult<T>> schedule(ChunkRenderBuildTask<T> task) {
+        if (!this.running.get()) {
+            throw new IllegalStateException("Executor is stopped");
+        }
 
-        final int maxX = chunkPos.getMaxX() + NEIGHBOR_BLOCK_RADIUS + 1;
-        final int maxY = chunkPos.getMaxY() + NEIGHBOR_BLOCK_RADIUS + 1;
-        final int maxZ = chunkPos.getMaxZ() + NEIGHBOR_BLOCK_RADIUS + 1;
+        WrappedTask<T> job = new WrappedTask<>(task);
 
-        final int minChunkX = minX >> 4;
-        final int maxChunkX = maxX >> 4;
+        this.buildQueue.add(job);
 
-        final int minChunkY = minY >> 4;
-        final int maxChunkY = maxY >> 4;
+        synchronized (this.jobNotifier) {
+            this.jobNotifier.notify();
+        }
 
-        final int minChunkZ = minZ >> 4;
-        final int maxChunkZ = maxZ >> 4;
+        return job.future;
+    }
+
+    /**
+     * Sets the current camera position of the player used for task prioritization.
+     */
+    public void setCameraPosition(double x, double y, double z) {
+        this.cameraPosition = new Vector3d(x, y, z);
+    }
+
+    /**
+     * Returns the current camera position of the player used for task prioritization.
+     */
+    public Vector3d getCameraPosition() {
+        return this.cameraPosition;
+    }
+
+    /**
+     * @return True if the build queue is empty
+     */
+    public boolean isBuildQueueEmpty() {
+        return this.buildQueue.isEmpty();
+    }
+
+    /**
+     * Initializes this chunk builder for the given world. If the builder is already running (which can happen during
+     * a world teleportation event), the worker threads will first be stopped and all pending tasks will be discarded
+     * before being started again.
+     * @param world The world instance
+     */
+    public void init(ClientWorld world) {
+        if (world == null) {
+            throw new NullPointerException("World is null");
+        }
+
+        this.stopWorkers();
 
         this.world = world;
-        this.chunks = chunks;
+        this.biomeCacheManager = new BiomeCacheManager(world.getDimension().getBiomeAccessType(), ((ClientWorldExtended) world).getBiomeSeed());
 
-        this.blockOffsetX = minX;
-        this.blockOffsetY = minY;
-        this.blockOffsetZ = minZ;
+        this.startWorkers();
+    }
 
-        this.chunkOffsetX = chunkPos.getX() - NEIGHBOR_CHUNK_RADIUS;
-        this.chunkOffsetY = chunkPos.getY() - NEIGHBOR_CHUNK_RADIUS;
-        this.chunkOffsetZ = chunkPos.getZ() - NEIGHBOR_CHUNK_RADIUS;
+    /**
+     * Returns the "optimal" number of threads to be used for chunk build tasks. This is always at least one thread,
+     * but can be up to the number of available processor threads on the system.
+     */
+    private static int getOptimalThreadCount() {
+        return Math.max(1, Runtime.getRuntime().availableProcessors());
+    }
 
-        // Hoist the lighting providers so that they can be directly accessed
-        ChunkLightingView blockLightProvider = this.world.getLightingProvider().get(LightType.BLOCK);
-        ChunkLightingView skyLightProvider = this.world.getLightingProvider().get(LightType.SKY);
+    /**
+     * Creates a {@link WorldSlice} around the given chunk section. If the chunk section is empty, null is returned.
+     * @param pos The position of the chunk section
+     * @return A world slice containing the section's context for rendering, or null if it has none
+     */
+    public WorldSlice createWorldSlice(ChunkSectionPos pos) {
+        WorldChunk[] chunks = WorldSlice.createChunkSlice(this.world, pos);
 
-        // Iterate over all sliced chunks
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                // Find the local position of the chunk in the sliced chunk array
-                int chunkXLocal = chunkX - this.chunkOffsetX;
-                int chunkZLocal = chunkZ - this.chunkOffsetZ;
+        if (chunks == null) {
+            return null;
+        }
 
-                // The local index for this chunk in the slice's data arrays
-                int chunkIdx = getLocalChunkIndex(chunkXLocal, chunkZLocal);
+        WorldSlice slice = this.pool.allocate();
+        slice.init(this, this.world, pos, chunks);
 
-                WorldChunk chunk = chunks[chunkIdx];
+        return slice;
+    }
 
-                this.biomeArrays[chunkIdx] = chunk.getBiomeArray();
+    /**
+     * Releases a world slice from a build task back to this builder's object pool.
+     * @param slice The chunk slice to release
+     */
+    public void releaseWorldSlice(WorldSlice slice) {
+        this.pool.release(slice);
+    }
 
-                int minBlockX = Math.max(minX, chunkX << 4);
-                int maxBlockX = Math.min(maxX, (chunkX + 1) << 4);
+    /**
+     * Returns the global biome cache for this world
+     */
+    public BiomeCacheManager getBiomeCacheManager() {
+        return this.biomeCacheManager;
+    }
 
-                int minBlockZ = Math.max(minZ, chunkZ << 4);
-                int maxBlockZ = Math.min(maxZ, (chunkZ + 1) << 4);
+    /**
+     * Called after a chunk's status is changed in the world (i.e. after a load or unload.) This is used to reset any
+     * caches which depend on its data and to release any pooled resources attached to it.
+     * @param x The x-position of the chunk
+     * @param z The z-position of the chunk
+     */
+    public void onChunkStatusChanged(int x, int z) {
+        this.biomeCacheManager.dropCachesForChunk(x, z);
+    }
 
-                for (int chunkY = minChunkY; chunkY <= maxChunkY; chunkY++) {
-                    int chunkYLocal = chunkY - this.chunkOffsetY;
+    /**
+     * Creates a rebuild task and defers it to the work queue. When the task is completed, it will be moved onto the
+     * completed uploads queued which will then be drained during the next available synchronization point with the
+     * main thread.
+     * @param render The render to rebuild
+     */
+    public void deferRebuild(ChunkRenderContainer<T> render) {
+        this.scheduleRebuildTaskAsync(render)
+                .thenAccept(this::enqueueUpload);
+    }
 
-                    ChunkSectionPos sectionPos = ChunkSectionPos.from(chunkX, chunkY, chunkZ);
-                    int sectionIdx = getLocalSectionIndex(chunkXLocal, chunkYLocal, chunkZLocal);
 
-                    this.blockLightArrays[sectionIdx] = blockLightProvider.getLightArray(sectionPos);
-                    this.skyLightArrays[sectionIdx] = skyLightProvider.getLightArray(sectionPos);
+    /**
+     * Enqueues the build task result to the pending result queue to be later processed during the next available
+     * synchronization point on the main thread.
+     * @param result The build task's result
+     */
+    private void enqueueUpload(ChunkBuildResult<T> result) {
+        this.uploadQueue.add(result);
+    }
 
-                    ChunkSection section = null;
+    /**
+     * Schedules the rebuild task asynchronously on the worker pool, returning a future wrapping the task.
+     * @param render The render to rebuild
+     */
+    public CompletableFuture<ChunkBuildResult<T>> scheduleRebuildTaskAsync(ChunkRenderContainer<T> render) {
+        return this.schedule(this.createRebuildTask(render));
+    }
 
-                    // Fetch the chunk section for this position if it's within bounds
-                    if (chunkY >= 0 && chunkY < 16) {
-                        section = chunk.getSectionArray()[chunkY];
-                    }
+    /**
+     * Creates a task to rebuild the geometry of a {@link ChunkRenderContainer}.
+     * @param render The render to rebuild
+     */
+    private ChunkRenderBuildTask<T> createRebuildTask(ChunkRenderContainer<T> render) {
+        render.cancelRebuildTask();
 
-                    // If no chunk section has been fetched, use an empty one which will return air blocks in the copy below
-                    if (section == null) {
-                        section = EMPTY_SECTION;
-                    }
+        WorldSlice slice = this.createWorldSlice(render.getChunkPos());
 
-                    int minBlockY = Math.max(minY, chunkY << 4);
-                    int maxBlockY = Math.min(maxY, (chunkY + 1) << 4);
+        if (slice == null) {
+            return new ChunkRenderEmptyBuildTask<>(render);
+        } else {
+            return new ChunkRenderRebuildTask<>(this, this.backend, render, slice);
+        }
+    }
 
-                    // Iterate over all block states in the overlapping section between this world slice and chunk section
-                    for (int y = minBlockY; y < maxBlockY; y++) {
-                        for (int z = minBlockZ; z < maxBlockZ; z++) {
-                            for (int x = minBlockX; x < maxBlockX; x++) {
-                                this.blockStates[this.getBlockIndex(x, y, z)] = section.getBlockState(x & 15, y & 15, z & 15);
-                            }
-                        }
-                    }
+    private class WorkerRunnable implements Runnable {
+        private final AtomicBoolean running = ChunkBuilder.this.running;
+
+        // The re-useable build buffers used by this worker for building chunk meshes
+        private final ChunkBuildBuffers bufferCache;
+
+        // Making this thread-local provides a small boost to performance by avoiding the overhead in synchronizing
+        // caches between different CPU cores
+        private final ChunkRenderContext pipeline;
+
+        public WorkerRunnable(ChunkBuildBuffers bufferCache, ChunkRenderContext pipeline) {
+            this.bufferCache = bufferCache;
+            this.pipeline = pipeline;
+        }
+
+        @Override
+        public void run() {
+            // Run until the chunk builder shuts down
+            while (this.running.get()) {
+                WrappedTask<T> job = this.getNextJob();
+
+                // If the job is null or no longer valid, keep searching for a task
+                if (job == null || job.isCancelled()) {
+                    continue;
+                }
+
+                // Perform the build task with this worker's local resources and obtain the result
+                ChunkBuildResult<T> result = job.task.performBuild(this.pipeline, this.bufferCache, job);
+
+                // After the result has been obtained, it's safe to release any resources attached to the task
+                job.task.releaseResources();
+
+                // The result can be null if the task is cancelled
+                if (result != null) {
+                    // Notify the future that the result is now available
+                    job.future.complete(result);
+                } else if (!job.isCancelled()) {
+                    // If the job wasn't cancelled and no result was produced, we've hit a bug
+                    job.future.completeExceptionally(new RuntimeException("No result was produced by the task"));
                 }
             }
         }
 
-        this.biomeCacheManager = builder.getBiomeCacheManager();
-        this.biomeCacheManager.populateArrays(chunkPos.getX(), chunkPos.getY(), chunkPos.getZ(), this.biomeCaches);
-    }
+        /**
+         * Returns the next task which this worker can work on or blocks until one becomes available. If no tasks are
+         * currently available, it will wait on {@link ChunkBuilder#jobNotifier} field until notified.
+         */
+        private WrappedTask<T> getNextJob() {
+            WrappedTask<T> job = ChunkBuilder.this.buildQueue.poll();
 
-    @Override
-    public BlockState getBlockState(BlockPos pos) {
-        return this.blockStates[this.getBlockIndex(pos.getX(), pos.getY(), pos.getZ())];
-    }
-
-    public BlockState getBlockState(int x, int y, int z) {
-        return this.blockStates[this.getBlockIndex(x, y, z)];
-    }
-
-    @Override
-    public FluidState getFluidState(BlockPos pos) {
-        return this.getBlockState(pos).getFluidState();
-    }
-
-    public FluidState getFluidState(int x, int y, int z) {
-        return this.getBlockState(x, y, z).getFluidState();
-    }
-
-    @Override
-    public float getBrightness(Direction direction, boolean shaded) {
-        return this.world.getBrightness(direction, shaded);
-    }
-
-    @Override
-    public LightingProvider getLightingProvider() {
-        return this.world.getLightingProvider();
-    }
-
-    @Override
-    public BlockEntity getBlockEntity(BlockPos pos) {
-        return this.getBlockEntity(pos, WorldChunk.CreationType.IMMEDIATE);
-    }
-
-    public BlockEntity getBlockEntity(BlockPos pos, WorldChunk.CreationType type) {
-        return this.chunks[this.getChunkIndexForBlock(pos)].getBlockEntity(pos, type);
-    }
-
-    @Override
-    public int getColor(BlockPos pos, ColorResolver resolver) {
-        BiomeColorCache cache;
-
-        if (this.prevColorResolver == resolver) {
-            cache = this.prevColorCache;
-        } else {
-            cache = this.colorResolvers.get(resolver);
-
-            if (cache == null) {
-                this.colorResolvers.put(resolver, cache = new BiomeColorCache(resolver, this));
+            if (job == null) {
+                synchronized (ChunkBuilder.this.jobNotifier) {
+                    try {
+                        ChunkBuilder.this.jobNotifier.wait();
+                    } catch (InterruptedException ignored) {
+                    }
+                }
             }
 
-            this.prevColorResolver = resolver;
-            this.prevColorCache = cache;
-        }
-
-        return cache.getBlendedColor(pos);
-    }
-
-    @Override
-    public int getLightLevel(LightType type, BlockPos pos) {
-        switch (type) {
-            case SKY:
-                return this.getLightLevel(this.skyLightArrays, pos);
-            case BLOCK:
-                return this.getLightLevel(this.blockLightArrays, pos);
-            default:
-                return 0;
+            return job;
         }
     }
 
-    @Override
-    public int getBaseLightLevel(BlockPos pos, int ambientDarkness) {
-        return 0;
-    }
+    private static class WrappedTask<T extends ChunkGraphicsState> implements CancellationSource {
+        private final ChunkRenderBuildTask<T> task;
+        private final CompletableFuture<ChunkBuildResult<T>> future;
 
-    @Override
-    public boolean isSkyVisible(BlockPos pos) {
-        return false;
-    }
-
-    private int getLightLevel(ChunkNibbleArray[] arrays, BlockPos pos) {
-        int x = pos.getX();
-        int y = pos.getY();
-        int z = pos.getZ();
-
-        ChunkNibbleArray array = arrays[this.getSectionIndexForBlock(x, y, z)];
-
-        if (array != null) {
-            return array.get(x & 15, y & 15, z & 15);
+        private WrappedTask(ChunkRenderBuildTask<T> task) {
+            this.task = task;
+            this.future = new CompletableFuture<>();
         }
 
-        return 0;
-    }
-
-    // TODO: Is this safe? The biome data arrays should be immutable once loaded into the client
-    @Override
-    public Biome getBiomeForNoiseGen(int x, int y, int z) {
-        BiomeArray array = this.biomeArrays[this.getBiomeIndexForBlock(x, z)];
-
-        if (array != null ) {
-            return array.getBiomeForNoiseGen(x, y, z);
+        @Override
+        public boolean isCancelled() {
+            return this.future.isCancelled();
         }
-
-        return this.world.getGeneratorStoredBiome(x, y, z);
-    }
-
-    /**
-     * Gets or computes the biome at the given global coordinates.
-     */
-    public Biome getCachedBiome(int x, int z) {
-        return this.biomeCaches[this.getChunkIndexForBlock(x, z)].getBiome(this, x, z);
-    }
-
-    /**
-     * Returns the index of a block in global coordinate space for this slice.
-     */
-    private int getBlockIndex(int x, int y, int z) {
-        int x2 = x - this.blockOffsetX;
-        int y2 = y - this.blockOffsetY;
-        int z2 = z - this.blockOffsetZ;
-
-        return (y2 * BLOCK_LENGTH * BLOCK_LENGTH) + (z2 * BLOCK_LENGTH) + x2;
-    }
-
-    /**
-     * {@link WorldSlice#getChunkIndexForBlock(int, int)}
-     */
-    private int getChunkIndexForBlock(BlockPos pos) {
-        return this.getChunkIndexForBlock(pos.getX(), pos.getZ());
-    }
-
-    /**
-     * Returns the index of a chunk in global coordinate space for this slice.
-     */
-    private int getChunkIndexForBlock(int x, int z) {
-        int x2 = (x >> 4) - this.chunkOffsetX;
-        int z2 = (z >> 4) - this.chunkOffsetZ;
-
-        return getLocalChunkIndex(x2, z2);
-    }
-
-    /**
-     * Returns the index of a biome in the global coordinate space for this slice.
-     */
-    private int getBiomeIndexForBlock(int x, int z) {
-        // Coordinates are in biome space!
-        // [VanillaCopy] WorldView#getBiomeForNoiseGen(int, int, int)
-        int x2 = (x >> 2) - this.chunkOffsetX;
-        int z2 = (z >> 2) - this.chunkOffsetZ;
-
-        return getLocalChunkIndex(x2, z2);
-    }
-
-    /**
-     * Returns the index of a chunk section in global coordinate space for this slice.
-     */
-    private int getSectionIndexForBlock(int x, int y, int z) {
-        int x2 = (x >> 4) - this.chunkOffsetX;
-        int y2 = (y >> 4) - this.chunkOffsetY;
-        int z2 = (z >> 4) - this.chunkOffsetZ;
-
-        return getLocalSectionIndex(x2, y2, z2);
-    }
-
-    /**
-     * Returns the index of a chunk in local coordinate space to this slice.
-     */
-    public static int getLocalChunkIndex(int x, int z) {
-        return (z * SECTION_LENGTH) + x;
-    }
-
-    /**
-     * Returns the index of a chunk section in local coordinate space to this slice.
-     */
-    public static int getLocalSectionIndex(int x, int y, int z) {
-        return (y * SECTION_LENGTH * SECTION_LENGTH) + (z * SECTION_LENGTH) + x;
-    }
-
-    @Override
-    public void reset() {
-        for (BiomeCache cache : this.biomeCaches) {
-            this.biomeCacheManager.release(cache);
-        }
-
-        Arrays.fill(this.biomeCaches, null);
-        Arrays.fill(this.biomeArrays, null);
-        Arrays.fill(this.blockLightArrays, null);
-        Arrays.fill(this.skyLightArrays, null);
-
-        this.biomeCacheManager = null;
-        this.chunks = null;
-        this.world = null;
-
-        this.colorResolvers.clear();
-        this.prevColorCache = null;
-        this.prevColorResolver = null;
-    }
-
-    public int getBlockOffsetX() {
-        return this.blockOffsetX;
-    }
-
-    public int getBlockOffsetY() {
-        return this.blockOffsetY;
-    }
-
-    public int getBlockOffsetZ() {
-        return this.blockOffsetZ;
     }
 }
